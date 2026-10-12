@@ -1,136 +1,184 @@
-# Simple FaaS (mini-faas)
+# shm-frame-bench
 
-A Kubernetes-native FaaS platform built from raw primitives — a custom CRD plus a `controller-runtime` reconciler — not Knative, not OpenFaaS. The point of the project is demonstrating how a serverless control plane actually works underneath those tools, not consuming one.
+A minimal shared-memory producer–consumer pipeline for uncompressed video frames on Linux, plus a reproducible latency benchmark.
 
-[![Demo preview](assets/demo-preview.gif)](assets/demo.webm)
+It serves as a baseline: how much latency and jitter come from moving frames through shared memory alone. The same benchmark also drives a writer/reader built on the [MXL SDK](https://github.com/dmf-mxl/mxl) (Media eXchange Layer, built from source, v1.2.0-dev), so the two can be compared directly.
 
-*Click the preview for the full demo (cold start → warm invocation → scale-to-zero).*
+![Power profile result](docs/power_mode.png)
+
+## Key findings
+
+On a Dell Latitude 7490 (Intel i5-8350U, 4 cores / 8 threads):
+
+1. **MXL's data path added no measurable latency over raw shared memory; its waiting strategy did.** With a busy-polling reader, MXL and the minimal pipeline were indistinguishable at 1080p50 (p99 855 vs. 875 µs, p = 0.13). MXL's normal blocking reader, which sleeps until each commit, cost about 70–90 µs extra at p99 (943 µs, p < 0.001) — about 0.5% of the 20 ms frame budget — in exchange for not burning a CPU core.
+2. **A sleeping reader was more robust to a noisy neighbour.** When a stray busy-looping process accidentally shared the reader's CPU, both busy-polling readers' p99 jumped to about 3.8 ms (roughly one scheduler time slice), while MXL's blocking reader stayed at 2.3 ms.
+3. **The CPU power profile dominated everything else.** In a randomized, interleaved test, the `performance` profile cut 1080p median latency by **45%** (1,257 → 686 µs) and p99 by **40%** (1,591 → 957 µs) compared with `power-saver` (p < 0.001 for both). Every single performance run was faster than every power-saver run.
+4. **In power-saver mode, 4K missed its real-time budget.** At 50 fps each frame has 20 ms. The 4K p99.9 reached up to 26 ms, and only the 8-slot ring buffer prevented dropped frames. In performance mode, 4K p99.9 stayed at 5–6 ms.
+5. **CPU pinning helped only when the CPU was slow.** In power-saver mode, pinning reduced 1080p p99 by about 10% (p < 0.01). In performance mode the effect disappeared (p = 0.70).
+6. **Core placement showed a power-mode-dependent effect.** In power-saver mode, placing producer and consumer on the *same* physical core cut 4K p99 by 21% (p < 0.001). In performance mode there was no significant difference. A CPU-frequency explanation was tested and ruled out (same clock speed in both placements); the mechanism remains open.
+
+**Takeaways:** on this machine the exchange layer itself was not the bottleneck — the frame copy, the reader's waiting strategy, the CPU power policy and other processes on the same CPU were. Tuning advice such as CPU pinning depends on the platform's power settings, and benchmark results that don't report the power profile and background load are not reproducible.
+
+## How it works
 
 ```
-                     ┌─────────────────────────────┐
-                     │   Function (CRD)            │
-                     │   image, port, idleTimeout,  │
-                     │   minReplicas, maxReplicas   │
-                     └──────────────┬───────────────┘
-                                    │ watched by
-                                    ▼
-┌───────────────┐   reconcile   ┌─────────────────────┐
-│  Controller    │◄─────────────│  Deployment + Service │
-│ (manager pod)  │──creates/────►  (owned by Function)  │
-└───────────────┘   updates     └─────────┬─────────────┘
-                                           │
-        cold start trigger                │ scales 0 ⇄ N
-        (TriggeredReplicas)               ▼
-┌───────────────┐   patches    ┌─────────────────────┐
-│   Gateway      │─────────────►   idle-timeout loop   │
-│ /invoke/{name} │              (scale-to-zero after   │
-│ reverse proxy  │              idleTimeoutSeconds)    │
-└───────┬────────┘              └─────────────────────┘
-        │
-        ▼
-   /metrics ──► Prometheus (cold start count + duration histogram)
+ producer (fixed fps)            /dev/shm ring buffer             consumer
+ ────────────────────            ───────────────────────          ────────────────────
+ copy frame into slot k%N  ──▶  [hdr][slot0][slot1]...[slotN-1] ──▶ copy frame out
+ stamp t_publish                 write_seq / read_seq counters      latency = now - t_publish
+ publish (write_seq++)                                              read_seq++
+ ring full? → drop frame
 ```
 
-## Status: what's actually verified here
+- Single-producer, single-consumer ring buffer with 8 slots in POSIX shared memory (`shm_open` + `mmap`).
+- C11 atomics with release/acquire ordering, so the consumer never reads a half-written frame.
+- Counters on separate cache lines to avoid false sharing.
+- Producer paced with absolute-time `clock_nanosleep`, so timing doesn't drift.
+- If the ring is full, the producer drops the frame and counts it (a missed real-time deadline).
+- Busy-waiting consumer: lowest latency, at the cost of one CPU core.
 
-This is a solo project, benchmarked and chaos-tested on a real cluster — not a toy that only runs a happy path once. Every number below came from a script run against a live cluster, not an estimate. Where something is untested, it's called out explicitly in its own section rather than implied by omission.
+**What latency measures:** from the moment the producer publishes a frame to the moment the consumer has copied it out. It includes the consumer's wake-up delay and the frame copy, not the producer's own copy.
 
-## Core mechanics
+## Method
 
-| Mechanic | Where | Verified how |
+- **Frames:** V210 (10-bit 4:2:2) sizes — 1080p = 5,529,600 B, 4K = 22,118,400 B — plus a 64 KB small-frame case. 50 fps, 1,500 frames (30 s) per run.
+- **Randomized, interleaved runs:** each round runs every configuration once, in shuffled order (`interleave.sh`), so slow drift in the machine (heat, background tasks, CPU speed) spreads evenly across configurations.
+- **Repetition:** 10–15 runs per configuration. Results report the median across runs.
+- **Statistics:** permutation test on per-run values (`compare.py`, 10,000 shuffles, fixed seed). With several comparisons per experiment, significance was judged against a Bonferroni-corrected threshold.
+- **Controls:** real hardware (no VM), on AC power, no other applications open, warm-up run before each experiment, CPU frequency and temperature sampled during runs (`freqmon.py`).
+
+## Results
+
+All values are medians across runs, in µs. "Dropped" was 0 in every configuration.
+
+### Experiment 1b — CPU pinning, 1080p, power-saver (15 rounds)
+
+| Config | p50 | p99 | p99 range |
+|---|---|---|---|
+| Unpinned | 1,347 | 1,859 | 1,634–1,965 |
+| Same physical core (CPUs 1, 5) | 1,269 | 1,650 | 1,537–1,901 |
+| Different cores (CPUs 1, 2) | 1,275 | 1,690 | 1,582–1,896 |
+
+Unpinned vs. same core p = 0.009; unpinned vs. different p = 0.004; same vs. different p = 0.44.
+
+### Experiment 2 — frame size × placement, power-saver (15 rounds)
+
+| Config | p50 | p99 | p99.9 |
+|---|---|---|---|
+| 64 KB, unpinned | 17 | 30 | 69 |
+| 64 KB, same core | 15 | 30 | 56 |
+| 64 KB, different cores | 17 | 28 | 136 |
+| 4K, unpinned | 5,456 | 19,175 | 23,679 |
+| 4K, same core | 5,138 | 15,278 | 18,147 |
+| 4K, different cores | 5,182 | 19,437 | 26,223 |
+
+64 KB: no significant differences (p ≥ 0.23). 4K same vs. different: p < 0.001. Measured clock during 4K runs: 877–916 MHz in both placements, 45–47 °C.
+
+### Experiment 3 — pinning and placement, performance profile (15 rounds)
+
+| Config | p50 | p99 | p99.9 |
+|---|---|---|---|
+| 1080p, unpinned | 694 | 994 | 1,596 |
+| 1080p, same core | 690 | 1,020 | 1,677 |
+| 1080p, different cores | 697 | 1,010 | 1,628 |
+| 4K, unpinned | 2,756 | 3,875 | 4,958 |
+| 4K, same core | 2,742 | 3,983 | 5,900 |
+| 4K, different cores | 2,744 | 3,792 | 5,052 |
+
+1080p unpinned vs. different: p = 0.70. 4K same vs. different: p = 0.084.
+
+### Experiment 4 — power profile, 1080p, interleaved (10 rounds)
+
+| Mode | p50 | p99 |
 |---|---|---|
-| Scale-to-zero | `function_controller.go`, idle-timeout check in the reconcile loop | Left a Function idle past `idleTimeoutSeconds`, watched the Deployment's replica count go to 0 via `kubectl get deploy -w` |
-| Cold-start trigger | `cmd/gateway/main.go`, `/invoke/{name}` patches `TriggeredReplicas` | Hit a scaled-to-zero function through the gateway, confirmed pod creation in `kubectl get pods -w`, then confirmed it scaled back to zero after the idle window |
-| Decoupled trigger vs. floor | `TriggeredReplicas` field, separate from `MinReplicas` | This was a real bug: the original code reused one field for both the gateway's trigger and the floor, so any gateway-triggered cold start permanently blocked scale-to-zero afterward. Fixed by splitting the field; re-tested the same idle-timeout scenario above after the fix to confirm scale-to-zero resumed working |
-| Graceful shutdown | `cmd/gateway/main.go`, `SIGTERM`/`SIGINT` handling + `http.Server.Shutdown(ctx)` | See chaos test below |
-| Metrics | `promauto` counter + histogram, `/metrics` on the gateway | Confirmed Prometheus (deployed in-cluster) is actually scraping the endpoint — target shows `UP` in Prometheus's own target list, and `coldStartTotal`/`coldStartDuration` return real values via PromQL |
-| AWS deployment | `config/aws/*.yaml` | These manifests were pulled live off the running EC2/k3s cluster with `kubectl get ... -o yaml`, not reconstructed from memory — so what's in the repo matches what's actually deployed |
+| power-saver | 1,257 | 1,591 |
+| performance | 686 | 957 |
 
-## Cold start vs. warm invocation
+p50: p < 0.001; p99: p < 0.001.
 
-5 runs each, forced cold by resetting `minReplicas`/`triggeredReplicas` to zero and deleting the Deployment before each cold run (`benchmark.sh`, results in `benchmark-results.csv`):
+A second pass of the same loop degraded 2–4× in both modes at once. The cause was found later: an orphaned busy-waiting `consumer` from an interrupted run had been left spinning on CPU 1 (see Experiment 6). The second pass was excluded from the effect-size estimate, but it still showed the same direction (p99 4,652 vs. 3,766 µs, p < 0.001). Raw data for both passes is in `results_exp4_powermode/`.
 
-| Run | Cold (s) | Warm (s) |
-|---|---|---|
-| 1 | 2.70 | 0.044 |
-| 2 | 2.68 | 0.039 |
-| 3 | 2.65 | 0.036 |
-| 4 | 2.67 | 0.041 |
-| 5 | 2.69 | 0.038 |
+### Experiment 5 — raw shared memory vs. MXL, 1080p50, performance profile (15 rounds)
 
-Cold start is roughly **65–70x** slower than a warm hit — expected for a scale-from-zero model, and the number exists because it was measured, not assumed. This is one benchmark run, not a statistically robust suite — see "What's genuinely untested."
+Three configurations, interleaved in random order, all pinned to the same CPUs (reader on CPU 1, writer on CPU 2), with background load removed (no browser, Kubernetes test cluster stopped):
 
-## Resilience: graceful shutdown under load
+| Config | Reader waits by | p50 | p99 | p99 range | p99.9 |
+|---|---|---|---|---|---|
+| `shm` — this repo's pipeline | busy-waiting | 669 | 875 | 822–1,001 | 1,532 |
+| `mxl_spin` — MXL writer/reader | busy-polling (`GetGrainNonBlocking`) | 692 | 855 | 810–1,019 | 1,281 |
+| `mxl_block` — MXL writer/reader | sleeping (`GetGrain`, futex wake-up) | 771 | 943 | 909–1,132 | 1,761 |
 
-Chaos test: send an in-flight request to a function with an artificial delay (`?delay=N` on the test function), kill the gateway pod mid-request, see what happens to that request.
+shm vs. mxl_spin: p = 0.13 (no detectable difference). shm vs. mxl_block: +69 µs, p < 0.001. mxl_spin vs. mxl_block: +89 µs, p < 0.001. Both significant comparisons pass the Bonferroni-corrected threshold (0.017). No frames were dropped or missed.
 
-- **First attempt, no shutdown handling**: pod killed instantly, in-flight request died immediately. Not acceptable for anything claiming to route live traffic.
-- **Added `SIGTERM` handling with a 10s shutdown timeout**: request still died, now failing at ~14.5s — the shutdown window was too short for the in-flight request to finish.
-- **Raised timeout to 25s**: request completed successfully, `200 OK` at ~15s into the delayed handler, well inside the shutdown budget. Verified two independent ways (through `kubectl port-forward` and from an in-cluster debug pod) to rule out the result being a quirk of the test method rather than the actual behavior.
+### Experiment 6 — unplanned noisy neighbour (same configurations as Experiment 5)
 
-## Prerequisites
+The first attempt at Experiment 5 ran while an orphaned busy-waiting `consumer` (from an interrupted earlier run) was spinning at ~90% CPU on CPU 1 — the same CPU as every reader. It was not a designed experiment, so treat it as indicative, but the pattern is clear:
 
-- Docker
-- `kind` v0.23.0 (pinned — newer alphas have breaking changes) for local development, or an AWS account for the real deployment
-- `kubectl` v1.30.x
-- Go 1.21+
-- (optional, for the AWS path) AWS CLI v2, an EC2 instance (`t3.small` minimum — `t3.micro` is too memory-constrained for k3s)
+| Config | p50 | p99 | p99 range | p99.9 |
+|---|---|---|---|---|
+| `shm` (busy-waiting) | 1,294 | 3,777 | 3,721–4,088 | 4,843 |
+| `mxl_spin` (busy-polling) | 1,352 | 3,789 | 3,764–3,895 | 5,686 |
+| `mxl_block` (sleeping) | 1,275 | 2,271 | 2,261–2,297 | 3,252 |
 
-## Setup (local, `kind`)
+Both busy-waiting readers had to take turns with the stray process, and their p99 settled at ~3.8 ms — about one scheduler time slice. The sleeping reader was woken directly by MXL's futex on each commit and was less affected. The orphan was found with `ps`, and `consumer.c` now has a watchdog that exits 5 s after the producer stops. Data: `results_exp5_contaminated/`.
 
-```bash
-kind create cluster --name mini-faas
-kubectl apply -f config/crd/function-crd.yaml
-kubectl apply -f config/rbac/manager-rbac.yaml
-kubectl apply -f config/rbac/gateway-rbac.yaml
-kubectl apply -f config/deploy/manager-deployment.yaml
-kubectl apply -f config/deploy/gateway-deployment.yaml
-kubectl apply -f config/observability/prometheus.yaml
-```
+## Limitations
 
-Deploy a sample function and invoke it through the gateway:
+- **One machine.** A 15 W laptop CPU with a single NUMA node; results may differ on server hardware, ARM, or multi-socket systems.
+- **Cross-session comparisons are weak.** The same configuration differed by up to ~9% between sessions, so only configurations measured together in one interleaved experiment are compared directly. Experiments 2 and 3 (power-saver vs. performance) were run in separate sessions; Experiment 4 confirms the power-profile effect within one session.
+- **Experiment 1a (not reported above)** ran configurations in blocks instead of interleaved. A 27% shift in one block turned out to be background interference, which is why all later experiments were randomized. Its data is kept in `results_exp1a/` as a record.
+- **Background load in Experiments 1–4.** A local Kubernetes (kind) test cluster (~15% CPU in total) and a web browser were running. Interleaving spreads this evenly across configurations, but absolute numbers include it. Both were removed for Experiment 5.
+- **MXL comparison differences:** MXL's ring held 10 grains vs. 8 slots here; MXL paces frames by its own grain index rather than `clock_nanosleep`; and MXL never makes the writer drop a frame — a slow reader instead gets "too late" and skips ahead (counted as `dropped` by `mxl_reader`). Both ran at 50 fps with identical 5,529,600-byte V210 frames.
+- **MXL was tested with its Flow API on one host only**, one writer and one reader, 1080p. Not tested: the Fabrics API, multiple readers, 4K, containers.
+- **Single producer, single consumer** only; no one-to-many fan-out, no network or RDMA path, no containers yet.
+- **Same-host only.** The baseline consumer only busy-waits; a sleeping (futex) reader was tested only through MXL's blocking API, not in the baseline itself.
+- **The same-core 4K effect in power-saver mode is unexplained.**
+
+## Build and run
 
 ```bash
-kubectl apply -f config/aws/function-sample.yaml   # works locally too, adjust image if needed
-kubectl port-forward svc/mini-faas-gateway 8080:8080
-curl http://localhost:8080/invoke/hello
+make
+# one run:  ./run.sh <frame_bytes> <fps> <num_frames> [label] [consumer_cpu] [producer_cpu]
+./run.sh 5529600 50 1500 test 1 2
+
+# randomized experiment:  ./interleave.sh <rounds> <frame_bytes> <fps> <frames> label:ccpu:pcpu ...
+./interleave.sh 15 5529600 50 1500 unp:: same:1:5 diff:1:2
+python3 summarize.py
+python3 compare.py unp diff          # permutation test on p99 (or add p50_us, p999_us)
 ```
 
-## Setup (real deployment, AWS EC2 + k3s)
+Check and record the power profile before every session:
+```bash
+powerprofilesctl get
+```
 
-See `config/aws/README.md` for the full walkthrough. Short version: provision a `t3.small` EC2 instance, install k3s, apply the manifests in `config/aws/`, point a NodePort Service at the gateway.
+### Files
 
-**Known, deliberate gap**: the security group allows SSH (22) and the k3s API (6443) from `0.0.0.0/0`. That's an explicit choice, not an oversight — worth flagging if you're judging this as production-representative rather than a demo.
+| File | Purpose |
+|---|---|
+| `common.h`, `producer.c`, `consumer.c` | Shared-memory ring buffer and the two processes |
+| `run.sh` | One run, prints a latency summary |
+| `sweep.sh` | One configuration, repeated N times |
+| `interleave.sh` | Several configurations, randomized order per round |
+| `analyze.py` | Percentiles and jitter from one run's latency CSV |
+| `summarize.py` | Median per configuration across runs |
+| `compare.py` | Permutation test between two configurations |
+| `freqmon.py` | Samples CPU clock and temperature during a run (no sudo) |
+| `stress.c` | CPU / memory-bandwidth load generator (no sudo) |
+| `mxl/mxl_writer.c`, `mxl/mxl_reader.c` | The same pipeline built on the MXL Flow API (reader: `block` or `spin`) |
+| `mxl/flow-*.json` | NMOS flow definitions (V210, 1080p50 and 2160p50) |
+| `mxl/build.sh` | Builds the MXL programs against an MXL source build in `~/mxl` |
+| `interleave_mxl.sh` | Randomized comparison of `shm`, `mxl-spin` and `mxl-block` |
 
-## Run the benchmark / chaos test yourself
+### Building the MXL part
+
+MXL was built from source without root access: CMake and Ninja via `pip install --user`, vcpkg cloned (full history) into `~/vcpkg`, and MXL configured with `cmake --preset Linux-GCC-Release -DBUILD_TESTS=OFF -DBUILD_DOCS=OFF -DBUILD_UTILS=OFF` after removing the test-only dependencies (`catch2`, `pcapplusplus`) from `vcpkg.json`. GStreamer development packages were not available, so MXL's GStreamer tools were not built. Then:
 
 ```bash
-./benchmark.sh        # writes benchmark-results.csv
+./mxl/build.sh
+./interleave_mxl.sh 15 1080 1500 shm:shm:1:2 mxl-spin:mxl_spin:1:2 mxl-block:mxl_block:1:2
 ```
 
-Chaos test is manual: trigger a delayed invocation, then `kubectl delete pod` the gateway mid-request, and watch whether the response completes.
+## Test machine
 
-## What's genuinely untested
-
-- Only one 5-run benchmark session exists — no statistically robust multi-session suite, no load testing under concurrent requests
-- Prometheus is scraping and metrics are real, but there's no Grafana dashboard — numbers are read via raw PromQL, not visualized
-- AWS deployment is manual (SSH + `kubectl apply`), not CI/CD-automated — no GitHub Actions pipeline for this project
-- No multi-node testing — both local (`kind`) and AWS (`k3s`) runs are single-node
-- No tested behavior under `MaxReplicas` saturation / backpressure
-- AWS billing: free-tier assumptions haven't been reconfirmed against an actual billing-console check or budget alert
-
-## Layout
-
-```
-api/v1alpha1/              Function CRD types + deepcopy
-internal/controller/       Reconciler: Deployment/Service lifecycle, idle-timeout scale-down
-cmd/manager/                Controller entrypoint (in-cluster deployment)
-cmd/gateway/                HTTP gateway: cold-start trigger, reverse proxy, /metrics
-functions/hello/           Minimal test function (supports ?delay=N for chaos testing)
-config/crd/                 CRD manifest
-config/rbac/                RBAC for manager + gateway
-config/deploy/               Local (kind) Deployment/Service manifests
-config/observability/        Prometheus ConfigMap + Deployment
-config/aws/                  AWS/k3s manifests, pulled live from the running cluster
-benchmark.sh                 Cold-vs-warm benchmark script, writes benchmark-results.csv
-```
+Dell Latitude 7490 · Intel Core i5-8350U (4 cores, 8 threads, 1 NUMA node) · 14 GiB RAM · Ubuntu, Linux 7.0.0-38-generic · gcc 15.2 · bare metal (no VM) · AC power.
