@@ -1,92 +1,136 @@
-# shm-frame-bench
+# Simple FaaS (mini-faas)
 
-A minimal shared-memory producer–consumer pipeline for uncompressed video frames on Linux, with a reproducible latency benchmark.
+A Kubernetes-native FaaS platform built from raw primitives — a custom CRD plus a `controller-runtime` reconciler — not Knative, not OpenFaaS. The point of the project is demonstrating how a serverless control plane actually works underneath those tools, not consuming one.
 
-It is a baseline for measuring how much latency and jitter come from moving frames through shared memory alone, before any media framework (such as MXL) adds its own overhead.
+[![Demo preview](assets/demo-preview.gif)](assets/demo.webm)
 
-## How it works
+*Click the preview for the full demo (cold start → warm invocation → scale-to-zero).*
 
 ```
- producer (fixed fps)            /dev/shm ring buffer             consumer
- ────────────────────            ───────────────────────          ────────────────────
- copy frame into slot k%N  ──▶  [hdr][slot0][slot1]...[slotN-1] ──▶ copy frame out
- stamp t_publish                 write_seq / read_seq counters      latency = now - t_publish
- publish (write_seq++)                                              read_seq++
- ring full? → drop frame
+                     ┌─────────────────────────────┐
+                     │   Function (CRD)            │
+                     │   image, port, idleTimeout,  │
+                     │   minReplicas, maxReplicas   │
+                     └──────────────┬───────────────┘
+                                    │ watched by
+                                    ▼
+┌───────────────┐   reconcile   ┌─────────────────────┐
+│  Controller    │◄─────────────│  Deployment + Service │
+│ (manager pod)  │──creates/────►  (owned by Function)  │
+└───────────────┘   updates     └─────────┬─────────────┘
+                                           │
+        cold start trigger                │ scales 0 ⇄ N
+        (TriggeredReplicas)               ▼
+┌───────────────┐   patches    ┌─────────────────────┐
+│   Gateway      │─────────────►   idle-timeout loop   │
+│ /invoke/{name} │              (scale-to-zero after   │
+│ reverse proxy  │              idleTimeoutSeconds)    │
+└───────┬────────┘              └─────────────────────┘
+        │
+        ▼
+   /metrics ──► Prometheus (cold start count + duration histogram)
 ```
 
-- **Single producer, single consumer** ring buffer with `N` slots (default 8).
-- Counters use C11 atomics with release/acquire ordering, so the consumer never sees a half-written frame.
-- Counters sit on separate cache lines to avoid false sharing between the two CPUs.
-- The producer is paced with absolute-time `clock_nanosleep`, so frame timing doesn't drift.
-- If the ring is full, the producer **drops** the frame and counts it, because a live pipeline can't wait. Dropped frames = missed real-time deadlines.
-- The consumer busy-waits for the lowest latency, at the cost of one CPU core.
+## Status: what's actually verified here
 
-## Build and run
+This is a solo project, benchmarked and chaos-tested on a real cluster — not a toy that only runs a happy path once. Every number below came from a script run against a live cluster, not an estimate. Where something is untested, it's called out explicitly in its own section rather than implied by omission.
+
+## Core mechanics
+
+| Mechanic | Where | Verified how |
+|---|---|---|
+| Scale-to-zero | `function_controller.go`, idle-timeout check in the reconcile loop | Left a Function idle past `idleTimeoutSeconds`, watched the Deployment's replica count go to 0 via `kubectl get deploy -w` |
+| Cold-start trigger | `cmd/gateway/main.go`, `/invoke/{name}` patches `TriggeredReplicas` | Hit a scaled-to-zero function through the gateway, confirmed pod creation in `kubectl get pods -w`, then confirmed it scaled back to zero after the idle window |
+| Decoupled trigger vs. floor | `TriggeredReplicas` field, separate from `MinReplicas` | This was a real bug: the original code reused one field for both the gateway's trigger and the floor, so any gateway-triggered cold start permanently blocked scale-to-zero afterward. Fixed by splitting the field; re-tested the same idle-timeout scenario above after the fix to confirm scale-to-zero resumed working |
+| Graceful shutdown | `cmd/gateway/main.go`, `SIGTERM`/`SIGINT` handling + `http.Server.Shutdown(ctx)` | See chaos test below |
+| Metrics | `promauto` counter + histogram, `/metrics` on the gateway | Confirmed Prometheus (deployed in-cluster) is actually scraping the endpoint — target shows `UP` in Prometheus's own target list, and `coldStartTotal`/`coldStartDuration` return real values via PromQL |
+| AWS deployment | `config/aws/*.yaml` | These manifests were pulled live off the running EC2/k3s cluster with `kubectl get ... -o yaml`, not reconstructed from memory — so what's in the repo matches what's actually deployed |
+
+## Cold start vs. warm invocation
+
+5 runs each, forced cold by resetting `minReplicas`/`triggeredReplicas` to zero and deleting the Deployment before each cold run (`benchmark.sh`, results in `benchmark-results.csv`):
+
+| Run | Cold (s) | Warm (s) |
+|---|---|---|
+| 1 | 2.70 | 0.044 |
+| 2 | 2.68 | 0.039 |
+| 3 | 2.65 | 0.036 |
+| 4 | 2.67 | 0.041 |
+| 5 | 2.69 | 0.038 |
+
+Cold start is roughly **65–70x** slower than a warm hit — expected for a scale-from-zero model, and the number exists because it was measured, not assumed. This is one benchmark run, not a statistically robust suite — see "What's genuinely untested."
+
+## Resilience: graceful shutdown under load
+
+Chaos test: send an in-flight request to a function with an artificial delay (`?delay=N` on the test function), kill the gateway pod mid-request, see what happens to that request.
+
+- **First attempt, no shutdown handling**: pod killed instantly, in-flight request died immediately. Not acceptable for anything claiming to route live traffic.
+- **Added `SIGTERM` handling with a 10s shutdown timeout**: request still died, now failing at ~14.5s — the shutdown window was too short for the in-flight request to finish.
+- **Raised timeout to 25s**: request completed successfully, `200 OK` at ~15s into the delayed handler, well inside the shutdown budget. Verified two independent ways (through `kubectl port-forward` and from an in-cluster debug pod) to rule out the result being a quirk of the test method rather than the actual behavior.
+
+## Prerequisites
+
+- Docker
+- `kind` v0.23.0 (pinned — newer alphas have breaking changes) for local development, or an AWS account for the real deployment
+- `kubectl` v1.30.x
+- Go 1.21+
+- (optional, for the AWS path) AWS CLI v2, an EC2 instance (`t3.small` minimum — `t3.micro` is too memory-constrained for k3s)
+
+## Setup (local, `kind`)
 
 ```bash
-make
-# ./run.sh <frame_bytes> <fps> <num_frames> [label] [consumer_cpu] [producer_cpu]
-./run.sh 5529600 50 500 1080p_native          # 1080p V210, 50 fps, 10 s
-./run.sh 5529600 50 500 1080p_pinned 1 0      # same, pinned to CPUs
-./run.sh 22118400 50 300 4k_native            # 4K V210
+kind create cluster --name mini-faas
+kubectl apply -f config/crd/function-crd.yaml
+kubectl apply -f config/rbac/manager-rbac.yaml
+kubectl apply -f config/rbac/gateway-rbac.yaml
+kubectl apply -f config/deploy/manager-deployment.yaml
+kubectl apply -f config/deploy/gateway-deployment.yaml
+kubectl apply -f config/observability/prometheus.yaml
 ```
 
-Frame sizes for V210 (10-bit 4:2:2, 16 bytes per 6 pixels):
-
-| Format | Bytes per frame |
-|---|---|
-| 1080p | 5,529,600 |
-| 2160p (4K) | 22,118,400 |
-
-Each run writes per-frame latencies to `results/<label>.csv` and prints mean, p50, p99, p99.9, max, jitter (std. dev.) and dropped frames.
-
-### Repeated runs (for real experiments)
-
-A single run is noise. `sweep.sh` runs one configuration several times and appends one row per run to `results/summary.csv`:
+Deploy a sample function and invoke it through the gateway:
 
 ```bash
-# ./sweep.sh <label> <reps> <frame_bytes> <fps> <num_frames> [consumer_cpu] [producer_cpu]
-./sweep.sh 1080p_native 10 5529600 50 500
-./sweep.sh 1080p_pinned 10 5529600 50 500 1 0
-./sweep.sh 4k_native    10 22118400 50 300
+kubectl apply -f config/aws/function-sample.yaml   # works locally too, adjust image if needed
+kubectl port-forward svc/mini-faas-gateway 8080:8080
+curl http://localhost:8080/invoke/hello
 ```
 
-### Adding load (contention experiments)
+## Setup (real deployment, AWS EC2 + k3s)
 
-`stress` is a small load generator included so no extra install (or sudo) is needed:
+See `config/aws/README.md` for the full walkthrough. Short version: provision a `t3.small` EC2 instance, install k3s, apply the manifests in `config/aws/`, point a NodePort Service at the gateway.
+
+**Known, deliberate gap**: the security group allows SSH (22) and the k3s API (6443) from `0.0.0.0/0`. That's an explicit choice, not an oversight — worth flagging if you're judging this as production-representative rather than a demo.
+
+## Run the benchmark / chaos test yourself
 
 ```bash
-./stress cpu 4 60 &    # 4 workers burning CPU for 60 s
-./sweep.sh 1080p_cpu4 10 5529600 50 500
-./stress mem 2 60 &    # 2 workers saturating memory bandwidth for 60 s
-./sweep.sh 1080p_mem2 10 5529600 50 500
+./benchmark.sh        # writes benchmark-results.csv
 ```
 
-Make sure the stress duration is longer than the whole sweep.
+Chaos test is manual: trigger a delayed invocation, then `kubectl delete pod` the gateway mid-request, and watch whether the response completes.
 
-### Running on Windows
+## What's genuinely untested
 
-This needs Linux (`shm_open`, `mmap`, `taskset`). On Windows, run it inside WSL2 (Ubuntu). WSL2 is a virtual machine, so expect more latency noise than on bare-metal Linux, and always state the environment next to your results.
+- Only one 5-run benchmark session exists — no statistically robust multi-session suite, no load testing under concurrent requests
+- Prometheus is scraping and metrics are real, but there's no Grafana dashboard — numbers are read via raw PromQL, not visualized
+- AWS deployment is manual (SSH + `kubectl apply`), not CI/CD-automated — no GitHub Actions pipeline for this project
+- No multi-node testing — both local (`kind`) and AWS (`k3s`) runs are single-node
+- No tested behavior under `MaxReplicas` saturation / backpressure
+- AWS billing: free-tier assumptions haven't been reconfirmed against an actual billing-console check or budget alert
 
-## Results
+## Layout
 
-Fill this in with your own machine's runs. Run each configuration several times and report the spread, not a single run.
-
-| Config | p50 (µs) | p99 (µs) | p99.9 (µs) | Jitter (µs) | Dropped |
-|---|---|---|---|---|---|
-| 1080p native | | | | | |
-| 1080p pinned | | | | | |
-| 4K native | | | | | |
-
-**Test machine:** CPU model, cores, RAM, kernel version (`uname -r`).
-
-## What latency includes here
-
-Measured from the moment the producer finishes writing a frame to the moment the consumer has copied it out. It includes the consumer's wake-up delay and the frame copy (`memcpy`). It does **not** include the producer's own copy.
-
-## Limitations
-
-- One producer and one consumer only.
-- Busy-waiting consumer (no futex or eventfd notification).
-- Same host only; no network or RDMA path.
+```
+api/v1alpha1/              Function CRD types + deepcopy
+internal/controller/       Reconciler: Deployment/Service lifecycle, idle-timeout scale-down
+cmd/manager/                Controller entrypoint (in-cluster deployment)
+cmd/gateway/                HTTP gateway: cold-start trigger, reverse proxy, /metrics
+functions/hello/           Minimal test function (supports ?delay=N for chaos testing)
+config/crd/                 CRD manifest
+config/rbac/                RBAC for manager + gateway
+config/deploy/               Local (kind) Deployment/Service manifests
+config/observability/        Prometheus ConfigMap + Deployment
+config/aws/                  AWS/k3s manifests, pulled live from the running cluster
+benchmark.sh                 Cold-vs-warm benchmark script, writes benchmark-results.csv
+```

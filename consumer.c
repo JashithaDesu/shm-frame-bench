@@ -33,14 +33,26 @@ int main(int argc, char **argv) {
     atomic_store_explicit(&h->consumer_ready, 1, memory_order_release);
 
     uint64_t r = 0;
+    uint64_t t_last = now_ns();   /* watchdog: time of last progress */
+    unsigned spins = 0;
     for (;;) {
         uint64_t w = atomic_load_explicit(&h->write_seq, memory_order_acquire);
         if (r == w) {
             if (atomic_load_explicit(&h->producer_done, memory_order_acquire) &&
                 r == atomic_load_explicit(&h->write_seq, memory_order_acquire))
                 break;
+            /* Watchdog: if the producer died (killed, Ctrl+C), never spin
+             * forever. Checked every 64k spins so the clock read is cheap. */
+            if (++spins == 65536) {
+                spins = 0;
+                if (now_ns() - t_last > 5ull * 1000000000ull) {
+                    fprintf(stderr, "consumer: no frames for 5 s, producer gone? exiting\n");
+                    break;
+                }
+            }
             continue;   /* busy-wait: lowest latency, but burns one CPU core */
         }
+        t_last = now_ns();
         unsigned char *slot = slot_ptr(h, r);
         slot_hdr_t *sh = (slot_hdr_t *)slot;
         memcpy(dst, slot + sizeof(slot_hdr_t), h->frame_size);
