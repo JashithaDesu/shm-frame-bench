@@ -1,0 +1,4 @@
+cpu1: mean 3553 MHz   min 2700   max 3600
+cpu2: mean 3550 MHz   min 2700   max 3604
+cpu5: mean 3493 MHz   min 400   max 3605
+temp: mean 80.3 C   max 82.0 C
