@@ -1,0 +1,41 @@
+{
+  "description": "shm-frame-bench 1080p50",
+  "id": "b7e3c1a0-5d2f-4e8a-9c41-0a1b2c3d4e51",
+  "tags": {
+    "urn:x-nmos:tag:grouphint/v1.0": [
+      "shm-frame-bench writer:1080p50"
+    ]
+  },
+  "format": "urn:x-nmos:format:video",
+  "label": "shm-frame-bench writer 1080p50",
+  "parents": [],
+  "media_type": "video/v210",
+  "grain_rate": {
+    "numerator": 50,
+    "denominator": 1
+  },
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "interlace_mode": "progressive",
+  "colorspace": "BT709",
+  "components": [
+    {
+      "name": "Y",
+      "width": 1920,
+      "height": 1080,
+      "bit_depth": 10
+    },
+    {
+      "name": "Cb",
+      "width": 960,
+      "height": 1080,
+      "bit_depth": 10
+    },
+    {
+      "name": "Cr",
+      "width": 960,
+      "height": 1080,
+      "bit_depth": 10
+    }
+  ]
+}
